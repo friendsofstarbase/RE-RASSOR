@@ -1,1 +1,200 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <WebSocketsClient.h>
+#include <TMC2208Stepper.h>
+#include <ArduinoJson.h>
+#include <math.h>
+#include <MPU9250.h>
+#include <WiFiClientSecure.h> 
 
+// --- Configuration ---
+const char *ssid = "Verizon_49FQTX"; // SSID to yours 
+const char *password = "bakery7quid2see"; // change wifi pw 
+const char *host = "re-rassor.com"; 
+const uint16_t port = 443; 
+const char *url = "/?name=Henry_Rover_V2&clientType=rover&secret=123"; // change to your rover 
+
+// --- Hardware Objects ---
+MPU9250 mpu;
+WiFiClientSecure client; 
+WebSocketsClient ws;
+String direction;
+
+// --- Stepper Motor Pins ---
+#define dirPinFrontLeft 32
+#define stepPinFrontLeft 22
+#define dirPinFrontRight 25
+#define stepPinFrontRight 26
+#define dirPinRearLeft 13
+#define stepPinRearLeft 12
+#define dirPinRearRight 16
+#define stepPinRearRight 4
+
+#define EN_PIN1 33 
+#define EN_PIN2 27 
+#define EN_PIN3 14 
+#define EN_PIN4 5  
+
+// Initialize Drivers (Assuming Hardware Serial 1)
+TMC2208Stepper driver1 = TMC2208Stepper(&Serial1);
+TMC2208Stepper driver2 = TMC2208Stepper(&Serial1);
+TMC2208Stepper driver3 = TMC2208Stepper(&Serial1);
+TMC2208Stepper driver4 = TMC2208Stepper(&Serial1);
+
+// --- State Variables ---
+bool motorRunning = false;
+double speedMultiplier = 1.0;
+double speedVal = 1.0;
+
+unsigned long lastLeftStep = 0;
+unsigned long lastRightStep = 0;
+unsigned long lastAllStep = 0;
+unsigned long lastMpuUpdate = 0;
+const unsigned long mpuUpdateInterval = 200000; // Microseconds
+
+// --- Forward Declarations ---
+void onWsEvent(WStype_t type, uint8_t *payload, size_t length);
+
+void setup() {
+    Serial.begin(115200);
+
+    // 1. WiFi Connection
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(400);
+        Serial.println("Connecting to WiFi...");
+    }
+    Serial.println("Connected to WiFi");
+
+    // 2. SSL Fix: Allow insecure connection for test server
+    client.setInsecure(); 
+
+    // 3. Hardware Pin Modes
+    pinMode(EN_PIN1, OUTPUT); digitalWrite(EN_PIN1, HIGH);
+    pinMode(EN_PIN2, OUTPUT); digitalWrite(EN_PIN2, HIGH);
+    pinMode(EN_PIN3, OUTPUT); digitalWrite(EN_PIN3, HIGH);
+    pinMode(EN_PIN4, OUTPUT); digitalWrite(EN_PIN4, HIGH);
+    
+    pinMode(stepPinFrontLeft, OUTPUT); pinMode(dirPinFrontLeft, OUTPUT);
+    pinMode(stepPinFrontRight, OUTPUT); pinMode(dirPinFrontRight, OUTPUT);
+    pinMode(stepPinRearLeft, OUTPUT); pinMode(dirPinRearLeft, OUTPUT);
+    pinMode(stepPinRearRight, OUTPUT); pinMode(dirPinRearRight, OUTPUT);
+
+    // 4. Driver Initialization
+    driver1.push(); driver1.pdn_disable(true); driver1.rms_current(800); driver1.toff(2);
+    driver2.push(); driver2.pdn_disable(true); driver2.rms_current(800); driver2.toff(2);
+    driver3.push(); driver3.pdn_disable(true); driver3.rms_current(800); driver3.toff(2);
+    driver4.push(); driver4.pdn_disable(true); driver4.rms_current(800); driver4.toff(2);
+
+    // 5. Sensor & WebSocket Setup
+    Wire.begin(2, 15); 
+    delay(200);
+    //mpu.setup(0x68); 
+
+    ws.beginSSL(host, port, url);
+    ws.onEvent(onWsEvent);
+}
+
+void loop() {
+    ws.loop();
+
+    unsigned long currentMicros = micros();
+    
+    // Motor Speed Calculation
+    int fullSpeedDelay = 3000 / (speedVal * 10);
+    int halfSpeedDelay = fullSpeedDelay * 2;
+
+    if (motorRunning) {
+        if (direction == "forwardLeft") {
+            if (currentMicros - lastRightStep >= fullSpeedDelay) {
+                digitalWrite(stepPinFrontRight, !digitalRead(stepPinFrontRight));
+                digitalWrite(stepPinRearRight, !digitalRead(stepPinRearRight));
+                lastRightStep = currentMicros;
+            }
+            if (currentMicros - lastLeftStep >= halfSpeedDelay) {
+                digitalWrite(stepPinFrontLeft, !digitalRead(stepPinFrontLeft));
+                digitalWrite(stepPinRearLeft, !digitalRead(stepPinRearLeft));
+                lastLeftStep = currentMicros;
+            }
+        }
+        else if (direction == "forwardRight") {
+            if (currentMicros - lastLeftStep >= fullSpeedDelay) {
+                digitalWrite(stepPinFrontLeft, !digitalRead(stepPinFrontLeft));
+                digitalWrite(stepPinRearLeft, !digitalRead(stepPinRearLeft));
+                lastLeftStep = currentMicros;
+            }
+            if (currentMicros - lastRightStep >= halfSpeedDelay) {
+                digitalWrite(stepPinFrontRight, !digitalRead(stepPinFrontRight));
+                digitalWrite(stepPinRearRight, !digitalRead(stepPinRearRight));
+                lastRightStep = currentMicros;
+            }
+        }
+        else if (direction == "forward" || direction == "backward" || direction == "left" || direction == "right") {
+            if (currentMicros - lastAllStep >= fullSpeedDelay) {
+                digitalWrite(stepPinFrontRight, !digitalRead(stepPinFrontRight));
+                digitalWrite(stepPinRearRight, !digitalRead(stepPinRearRight));
+                digitalWrite(stepPinFrontLeft, !digitalRead(stepPinFrontLeft));
+                digitalWrite(stepPinRearLeft, !digitalRead(stepPinRearLeft));
+                lastAllStep = currentMicros;
+            }
+        }
+    }
+
+    // IMU Data Send
+   /* if (currentMicros - lastMpuUpdate >= mpuUpdateInterval) {
+        if (mpu.update()) {
+            DynamicJsonDocument jsonDoc(256);
+            jsonDoc["type"] = "IMU";
+            jsonDoc["yaw"] = mpu.getYaw();
+            jsonDoc["pitch"] = mpu.getPitch();
+            jsonDoc["roll"] = mpu.getRoll();
+
+            String jsonString;
+            serializeJson(jsonDoc, jsonString);
+            ws.sendTXT(jsonString);
+        }
+        lastMpuUpdate = currentMicros;
+    }*/
+}
+
+void onWsEvent(WStype_t type, uint8_t *payload, size_t length) {
+    switch (type) {
+        case WStype_DISCONNECTED:
+            Serial.println("Disconnected from WebSocket");
+            break;
+        case WStype_CONNECTED:
+            Serial.println("Connected to WebSocket");
+            ws.sendTXT("{\"type\":\"getConnectedClients\"}");
+            break;
+        case WStype_TEXT:
+            DynamicJsonDocument jsonDoc(2048);
+            DeserializationError error = deserializeJson(jsonDoc, (char *)payload);
+            if (error) return;
+
+            if (jsonDoc["type"] == "move") {
+                direction = jsonDoc["direction"].as<String>();
+                if (direction == "stop") {
+                    motorRunning = false;
+                    digitalWrite(EN_PIN1, HIGH); digitalWrite(EN_PIN2, HIGH);
+                    digitalWrite(EN_PIN3, HIGH); digitalWrite(EN_PIN4, HIGH);
+                } else {
+                    motorRunning = true;
+                    digitalWrite(EN_PIN1, LOW); digitalWrite(EN_PIN2, LOW);
+                    digitalWrite(EN_PIN3, LOW); digitalWrite(EN_PIN4, LOW);
+                    
+                    // Set Directions
+                    if (direction == "forward") {
+                        digitalWrite(dirPinFrontLeft, LOW); digitalWrite(dirPinFrontRight, HIGH);
+                        digitalWrite(dirPinRearLeft, LOW); digitalWrite(dirPinRearRight, HIGH);
+                    } else if (direction == "backward") {
+                        digitalWrite(dirPinFrontLeft, HIGH); digitalWrite(dirPinFrontRight, LOW);
+                        digitalWrite(dirPinRearLeft, HIGH); digitalWrite(dirPinRearRight, LOW);
+                    }
+                    // ... (Add other dirPin logic as needed)
+                }
+            } else if (jsonDoc["type"] == "speed") {
+                speedVal = speedMultiplier * jsonDoc["speed"].as<double>();
+            }
+            break;
+    }
+}
