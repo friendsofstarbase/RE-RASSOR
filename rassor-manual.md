@@ -1,4 +1,4 @@
-The manual is currently being updated 2/5 
+The manual is currently being updated 3/2..
 
 Please visit the RERASSOR manual for BOM and instructions 
 
